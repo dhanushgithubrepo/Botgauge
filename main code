@@ -1,0 +1,75 @@
+# We behan by Instaling the necessary librarie
+!pip install -q datasets beir transformers sentence-transformers torch
+
+# imprting the required api
+import torch
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
+from sklearn.metrics import ndcg_score
+
+# As the dataset is huge  a subset of the BEIR FiQA dataset was used
+dataset = load_dataset('beir', 'fiqa', split='train[:100]')
+
+# Initialize lightweight retrieval and reranking models as instructed the retrivel model is used for embedding model which is conveting text into vectors folowed by ranking model
+retrieval_model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+reranking_model = AutoModelForSequenceClassification.from_pretrained("cross-encoder/ms-marco-MiniLM-L-12-v2")
+retrieval_tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+reranking_tokenizer = AutoTokenizer.from_pretrained("cross-encoder/ms-marco-MiniLM-L-12-v2")
+
+def encode_text(text, model, tokenizer):
+    inputs = tokenizer(text, return_tensors='pt', truncation=True, padding=True)
+    with torch.no_grad():
+        embeddings = model(**inputs).last_hidden_state.mean(dim=1)
+    return embeddings
+
+def retrieve_candidates(query, top_k=5):
+    query_embedding = encode_text(query, retrieval_model, retrieval_tokenizer)
+    scores = []
+    
+    for example in dataset:
+        context = example['text']
+        context_embedding = encode_text(context, retrieval_model, retrieval_tokenizer)
+        score = torch.cosine_similarity(query_embedding, context_embedding).item()
+        scores.append((score, context, example['title']))
+
+    # Sorting by retrieval score and return top K candidates
+    return sorted(scores, key=lambda x: x[0], reverse=True)[:top_k]
+
+def rerank_candidates(query, candidates):
+    # Prepare input for reranking by pairing query with each context
+    inputs = reranking_tokenizer([(query, context) for _, context, _ in candidates], 
+                                 padding=True, truncation=True, return_tensors="pt")
+    with torch.no_grad():
+        outputs = reranking_model(**inputs)
+    scores = outputs.logits.squeeze().tolist()
+    
+    # Sort by reranking scores
+    return sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+
+def evaluate(query):
+    # Step 1: Retrieve top 5 candidates
+    top_k_candidates = retrieve_candidates(query, top_k=5)
+    
+    # Step 2: Rerank the candidates based on the query
+    reranked_candidates = rerank_candidates(query, top_k_candidates)
+
+    # Simulated ground truth for NDCG calculation (replace with actual logic)
+    ground_truth = [1 if 'Paris' in candidate[1] else 0 for _, candidate in top_k_candidates]
+    rerank_scores = [score for score, _ in reranked_candidates]
+    
+    # Computeing NDCG@5 score
+    ndcg_value = ndcg_score([ground_truth], [rerank_scores])
+
+    return reranked_candidates, ndcg_value
+
+# Example query
+query = "What is the capital of France?"
+
+# Run evaluation for the query
+reranked_results, ndcg_value = evaluate(query)
+
+# Output results
+print(f"NDCG@5: {ndcg_value:.4f}")
+print("Top Candidates (After Reranking):")
+for score, (original_score, context, title) in reranked_results:
+    print(f"Score: {score:.4f}, Context: {context}, Title: {title}")
